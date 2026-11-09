@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # Fast checks + build. Deployment depends only on this job.
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,20 +23,30 @@ jobs:
       - run: npm run check:boundaries
       - run: npm run typecheck
       - run: npm test
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
-        env:
-          CI: 'true'
       - run: npx vite build
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
+  # Browser tests (software-rendered WebGL, slow). Reported separately; they do not block deploys.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+        env:
+          CI: 'true'
+
   deploy:
-    # Publishes main to GitHub Pages
-    # (enable once under Settings → Pages → Source: GitHub Actions).
+    # Publishes main to GitHub Pages.
     if: github.ref == 'refs/heads/main'
-    needs: test
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       pages: write
