@@ -29,7 +29,7 @@ npm run test:e2e     # Playwright: mobile (touch) + desktop
 npm run ci           # boundaries + typecheck + unit tests + build
 ```
 
-Deployment: `.github/workflows/ci.yml` tests every push and publishes the default branch to GitHub Pages.
+Deployment: `.github/workflows/ci.yml` tests every push and publishes `main` to GitHub Pages.
 Enable it once under **Settings → Pages → Source: GitHub Actions**.
 
 ## Architecture
