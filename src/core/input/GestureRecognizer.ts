@@ -18,6 +18,8 @@ export interface GestureHandlers {
   tap(fingers: number): void;
   /** All fingers of a navigation gesture lifted. */
   gestureEnd?(): void;
+  /** A touch went down and may become a stroke (call `poll()` every frame until it does). */
+  pendingStart?(): void;
 }
 
 export interface GestureOptions {
@@ -90,6 +92,7 @@ export class GestureRecognizer {
     switch (s.kind) {
       case 'idle':
         this.state = { kind: 'pending', id, points: [p] };
+        this.h.pendingStart?.();
         return;
       case 'pending': {
         const first = s.points[s.points.length - 1]!;
@@ -159,6 +162,24 @@ export class GestureRecognizer {
       case 'idle':
         return;
     }
+  }
+
+  /**
+   * Called every frame while a touch is pending: a finger held still starts painting after
+   * `holdMs` even without move events (needed for press-and-hold tools such as pouring).
+   */
+  poll(t: number): void {
+    const s = this.state;
+    if (s.kind !== 'pending') return;
+    const first = s.points[0]!;
+    if (t - first.t < this.opts.holdMs) return;
+    this.state = { kind: 'stroke', id: s.id, last: s.points[s.points.length - 1]! };
+    this.h.strokeStart(first);
+    if (s.points.length > 1) this.h.strokeMove(s.points.slice(1));
+  }
+
+  get isPending(): boolean {
+    return this.state.kind === 'pending';
   }
 
   up(id: number, t: number): void {

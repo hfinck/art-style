@@ -124,6 +124,8 @@ export interface Stamp {
   prevDirY: number;
   /** Arc length from the start of the stroke. */
   distance: number;
+  /** Milliseconds since the start of the stroke (interpolated along the path). */
+  time: number;
 }
 
 export interface StrokeRenderer {
@@ -140,9 +142,27 @@ export interface StyleSnapshot {
   dispose(): void;
 }
 
+/**
+ * Optional time-based behaviour (e.g. wet paint that keeps flowing).
+ *
+ * The core calls `tick()` at a fixed rate while `active` is true and records exactly when
+ * each tick happened relative to commands and stamps, so replay (undo/redo, loading) is
+ * exact. Ticks must therefore be deterministic: no wall-clock time, no Math.random.
+ * Simulation state must be part of `snapshot()`.
+ */
+export interface Simulation {
+  /** True while there is something left to simulate (e.g. paint still spreading). */
+  readonly active: boolean;
+  tick(): void;
+}
+
 export interface StyleSession {
   /** Clear the canvas to its initial state. */
   reset(): void;
+  /**
+   * Prepare a stroke. Must not change the canvas or simulation state: the stroke may be
+   * created while earlier strokes are still being drawn. Do that work in `stamp()`.
+   */
   beginStroke(toolId: string, settings: SettingValues, rng: Random): StrokeRenderer;
   runAction(actionId: string, settings: SettingValues, rng: Random): void;
   /**
@@ -152,6 +172,8 @@ export interface StyleSession {
   render(target: GpuTarget, dirty: Rect): void;
   snapshot(): StyleSnapshot;
   restore(snapshot: StyleSnapshot): void;
+  /** Optional fixed-rate simulation. */
+  readonly simulation?: Simulation;
   dispose(): void;
 }
 
@@ -229,5 +251,6 @@ export interface GpuToolkit {
   updateInPlace(target: GpuTarget, program: GpuProgram, vertices: Float32Array): void;
   /** Run `program` over the polygon and write into `target` (no feedback). */
   draw(target: GpuTarget, program: GpuProgram, vertices: Float32Array, scissor?: Rect): void;
-  copy(source: GpuTarget, destination: GpuTarget): void;
+  /** Copy all attachments (optionally only `rect`). Both targets must have the same layout. */
+  copy(source: GpuTarget, destination: GpuTarget, rect?: Rect): void;
 }

@@ -3,6 +3,8 @@ import type { Stamp } from '../plugin-api/types';
 interface Pt {
   x: number;
   y: number;
+  /** Time in ms (interpolated along the path). */
+  t: number;
 }
 
 /**
@@ -17,7 +19,7 @@ export class StrokeResampler {
   private carry = 0; // distance travelled since the last stamp
   private distance = 0;
   private index = 0;
-  private dir: Pt | null = null;
+  private dir: { x: number; y: number } | null = null;
   private prevStamp: Stamp | null = null;
   /** Stamps held back until the initial direction is known. */
   private buffered: Pt[] = [];
@@ -33,12 +35,14 @@ export class StrokeResampler {
     private readonly emit: (s: Stamp) => void,
   ) {
     if (!(spacing > 0)) throw new Error('spacing must be > 0');
-    this.initDistance = Math.min(24, Math.max(spacing, directionSmoothing * 0.5, 4));
+    // Tools without direction smoothing do not need to know the direction up front, so the
+    // first stamp is emitted immediately (e.g. press-and-hold pouring).
+    this.initDistance = directionSmoothing > 0 ? Math.min(24, Math.max(spacing, directionSmoothing * 0.5, 4)) : 0;
   }
 
-  add(x: number, y: number): void {
+  add(x: number, y: number, t = 0): void {
     if (this.finished) return;
-    const p = { x, y };
+    const p = { x, y, t };
     if (this.ctrl.length === 0) {
       this.ctrl.push(p, p);
       this.start = p;
@@ -71,7 +75,7 @@ export class StrokeResampler {
     const n = Math.min(128, Math.max(1, Math.ceil(chord / 1.5)));
     let a = p1;
     for (let i = 1; i <= n; i++) {
-      const b = i === n ? p2 : catmullRom(p0, p1, p2, p3, i / n);
+      const b = i === n ? p2 : { ...catmullRom(p0, p1, p2, p3, i / n), t: p1.t + (p2.t - p1.t) * (i / n) };
       this.walk(a, b);
       a = b;
     }
@@ -85,7 +89,7 @@ export class StrokeResampler {
       pos += this.spacing - this.carry;
       this.carry = 0;
       const t = pos / len;
-      const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+      const p = { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, t: a.t + (b.t - a.t) * t };
       this.queue(p, this.spacing);
     }
     this.carry += len - pos;
@@ -99,7 +103,10 @@ export class StrokeResampler {
       this.index++;
       const s = this.start!;
       const d = Math.hypot(p.x - s.x, p.y - s.y);
-      if (d >= this.initDistance) {
+      if (this.initDistance === 0) {
+        this.dir = d > 1e-6 ? { x: (p.x - s.x) / d, y: (p.y - s.y) / d } : { x: 1, y: 0 };
+        this.flushBuffered(false);
+      } else if (d >= this.initDistance) {
         this.dir = { x: (p.x - s.x) / d, y: (p.y - s.y) / d };
         this.flushBuffered(false);
       }
@@ -157,6 +164,7 @@ export class StrokeResampler {
       prevDirX: prev ? prev.dirX : dir.x,
       prevDirY: prev ? prev.dirY : dir.y,
       distance,
+      time: p.t,
     };
     this.prevStamp = stamp;
     this.emit(stamp);
@@ -164,14 +172,15 @@ export class StrokeResampler {
 }
 
 /** Centripetal Catmull–Rom (alpha = 0.5), Barry–Goldman formulation. */
-function catmullRom(p0: Pt, p1: Pt, p2: Pt, p3: Pt, u: number): Pt {
+function catmullRom(p0: Pt, p1: Pt, p2: Pt, p3: Pt, u: number): { x: number; y: number } {
   const knot = (a: Pt, b: Pt) => Math.max(1e-4, Math.sqrt(Math.hypot(b.x - a.x, b.y - a.y)));
   const t0 = 0;
   const t1 = t0 + knot(p0, p1);
   const t2 = t1 + knot(p1, p2);
   const t3 = t2 + knot(p2, p3);
   const t = t1 + (t2 - t1) * u;
-  const mix = (a: Pt, b: Pt, ta: number, tb: number): Pt => {
+  type P = { x: number; y: number };
+  const mix = (a: P, b: P, ta: number, tb: number): P => {
     const w = (t - ta) / (tb - ta);
     return { x: a.x + (b.x - a.x) * w, y: a.y + (b.y - a.y) * w };
   };

@@ -111,4 +111,16 @@ describe('GestureRecognizer', () => {
     g.move(1, [pt(10, 0, 30)]);
     expect(log).toContain('view');
   });
+
+  it('a finger held still starts painting via poll() after the hold time', () => {
+    const { g, log } = setup();
+    g.down(1, pt(0, 0, 0));
+    g.poll(30);
+    expect(log).toEqual([]);
+    g.poll(80);
+    expect(log).toEqual(['start']);
+    expect(g.isPainting).toBe(true);
+    g.up(1, 900);
+    expect(log).toEqual(['start', 'end']);
+  });
 });
