@@ -1,5 +1,5 @@
 import type { GpuCaps, GpuToolkit, Rect, TextureFormat, UniformValue } from '../plugin-api/types';
-import { boundsOf, clipToBounds, fullRect, isEmpty } from '../util/rect';
+import { boundsOf, clipToBounds, fullRect, isEmpty, rectVertices } from '../util/rect';
 import { Program } from './Program';
 import { RenderTarget, type TargetOptions } from './RenderTarget';
 
@@ -185,12 +185,18 @@ export class WebGLToolkit implements GpuToolkit {
     gl.disable(gl.SCISSOR_TEST);
   }
 
-  copy(source: RenderTarget, destination: RenderTarget): void {
+  copy(source: RenderTarget, destination: RenderTarget, rect?: Rect): void {
     const copy = this.copyProgram(source.textures.length);
     const uniforms: Record<string, UniformValue> = { uScratchOrigin: [0, 0] };
     source.textures.forEach((t, i) => (uniforms[`uScratch${i}`] = t));
     copy.setUniforms(uniforms);
-    this.draw(destination, copy, fullRect(destination.width, destination.height));
+    if (rect) {
+      const r = clipToBounds(rect, destination.width, destination.height);
+      if (isEmpty(r)) return;
+      this.draw(destination, copy, rectVertices(r.x, r.y, r.w, r.h), r);
+    } else {
+      this.draw(destination, copy, fullRect(destination.width, destination.height));
+    }
   }
 
   /** Core-internal: draw with a program that has its own vertex shader into the bound framebuffer. */

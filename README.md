@@ -3,9 +3,13 @@
 A mobile-first web app for painting in artist-inspired styles. Each style is a plugin.
 
 **First style: Colour Sweep**, inspired by the technique of Alex Voinea:
-1. **Splodge**: drop blobs of colour (tap, drag, or *Scatter*).
-2. **Bury**: pour white over them (*Pour* or *Cover all*).
-3. **Sweep**: drag a broad brush through the wet paint. Buried colour is pulled up and smeared into long, streaky trails.
+1. **Splodge**: pour colour. Tap for a blob, hold to keep pouring, drag for a trail.
+   Pouring into a puddle pushes the earlier colours outward into rings without mixing them,
+   and puddles keep spreading for a moment afterwards. *Scatter* pours several ring stacks at once.
+2. **Bury** (optional): pour white over them (*Pour* or *Cover all*).
+3. **Sweep**: drag a broad brush through the wet paint. Each bristle carries the colour it picked up,
+   so ring stacks are pulled into long, pure, parallel bands. Fast strokes and sharp turns fling
+   splashes of the carried paint outward.
 
 ## Use
 
@@ -52,7 +56,11 @@ Key ideas:
 - **Strokes are data.** Every stroke is stored as filtered input points in normalised coordinates, with a random seed.
   Undo restores the nearest GPU checkpoint and replays the commands after it. Replay is bit-identical to live painting (an e2e test checks this).
 - **Input never drops.** All coalesced pointer samples are kept. Stamps are queued and drawn under a per-frame budget that adapts to the frame rate, so fast strokes catch up instead of skipping.
-- **GPU simulation.** Paint is two wet layers (top + buried) of colour and thickness in half-float textures. The sweep brush is a row of bristles, each carrying paint. On every step a bristle picks up paint ahead of it and lays it down behind. Lighting from the paint height gives the glossy look.
+- **GPU paint model.** Paint is two wet layers (top + buried) of colour and thickness in half-float textures. Lighting from the paint height gives the glossy look.
+  - *Pouring* is an area-preserving radial push: new paint appears at the centre and existing paint moves outward, so colours form rings instead of mixing.
+  - *Spreading* stretches a puddle around its pour point and eases out. Rings stay crisp and get thinner.
+  - *Sweeping* uses a paint-history ring buffer per bristle (sample and hold): each bristle lays down the colour it picked up at its last reload, which gives pure parallel bands. Speed and turning rate (from timestamped input) drive momentum splashes.
+- **Time-based simulation with exact replay.** Styles can expose a `simulation` that the core ticks at a fixed 30 Hz. The engine records when each tick happened relative to commands and stamps, so undo/redo and loading replay the flowing paint exactly.
 - **Touch first.** Browser gestures are blocked on the canvas. A short delay before painting starts lets a second finger turn the touch into navigation without leaving a mark. Lost GPU contexts are rebuilt by replaying the command log.
 
 `npm run check:boundaries` enforces the dependency rules.
@@ -61,5 +69,5 @@ Key ideas:
 
 1. Create `src/styles/<id>/index.ts` with a default export implementing `StylePlugin` from `@core/plugin-api`.
    It declares a manifest, phases, tools, actions, palettes and settings; the UI is generated from these.
-2. Implement `createSession(ctx)`. You get a `GpuToolkit` (fragment-shader programs, multi-attachment targets, `updateInPlace` for read-modify-write passes), the canvas size, and `markDirty`. The core handles input smoothing, resampling, history, saving and export.
+2. Implement `createSession(ctx)`. Optionally expose `simulation` for time-based behaviour (it must be deterministic and included in snapshots). You get a `GpuToolkit` (fragment-shader programs, multi-attachment targets, `updateInPlace` for read-modify-write passes), the canvas size, and `markDirty`. The core handles input smoothing, resampling, history, saving and export.
 3. Add one line to `src/app/styles.ts`.

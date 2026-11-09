@@ -53,7 +53,7 @@ export function detectDeviceProfile(): DeviceProfile {
   const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
   const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
   if (coarse || memory <= 4) {
-    return { pixelBudget: 2_000_000, checkpointInterval: 8, maxCheckpoints: 3, maxDpr: 2 };
+    return { pixelBudget: 2_000_000, checkpointInterval: 8, maxCheckpoints: 2, maxDpr: 2 };
   }
   return { pixelBudget: 4_000_000, checkpointInterval: 8, maxCheckpoints: 6, maxDpr: 2 };
 }
@@ -65,9 +65,19 @@ interface StrokeJob {
   queue: Stamp[];
   qi: number;
   ended: boolean;
-  /** Raw normalised points (converted to Float32Array on commit). */
+  /** Normalised points + time (converted to Float32Array on commit). */
   points: number[];
+  /** Timestamp of the first input point. */
+  t0: number;
+  /** Stamps applied so far. */
+  stampsDone: number;
+  /** Simulation ticks that happened during this stroke (stamp count at each tick). */
+  ticks: number[];
 }
+
+/** Simulation ticks per second (fixed, so recorded tick counts mean the same everywhere). */
+const TICK_HZ = 30;
+const TICK_MS = 1000 / TICK_HZ;
 
 /**
  * The painting engine: owns the GL context, the active style session, input,
@@ -106,6 +116,9 @@ export class Engine {
   private revision = 0;
   private contextLost = false;
   private disposed = false;
+  /** Ticks run since the last command (recorded into the next command). */
+  private pendingTicks = 0;
+  private tickClock = 0;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -146,6 +159,7 @@ export class Engine {
         if (n === 2) void this.undo();
         else if (n === 3) void this.redo();
       },
+      pendingStart: () => this.requestFrame(),
     });
     this.unbindInput = bindPointerInput(canvas, this.recognizer, {
       onWheel: (x, y, dy, pinch) => {
@@ -225,14 +239,22 @@ export class Engine {
     const settings = structuredClone(tool.settings);
     const renderer = this.session.beginStroke(tool.toolId, settings, createRandom(seed));
     const job: StrokeJob = {
-      cmd: { kind: 'stroke', tool: tool.toolId, settings, seed, points: new Float32Array(0) },
+      cmd: { kind: 'stroke', tool: tool.toolId, settings, seed, points: new Float32Array(0), stride: 3 },
       renderer,
       resampler: null!,
       queue: [],
       qi: 0,
       ended: false,
       points: [],
+      t0: p.t,
+      stampsDone: 0,
+      ticks: [],
     };
+    if (this.jobs.length === 0) {
+      // Ticks that ran since the last command happen before this stroke on replay.
+      job.cmd.ticksBefore = this.pendingTicks;
+      this.pendingTicks = 0;
+    }
     job.resampler = new StrokeResampler(renderer.spacing, renderer.directionSmoothing, (s) => job.queue.push(s));
     this.live = job;
     this.jobs.push(job);
@@ -245,8 +267,9 @@ export class Engine {
     // Quantise exactly as stored so live rendering and replay are bit-identical.
     const nx = Math.fround(x / this.width);
     const ny = Math.fround(y / this.height);
-    job.points.push(nx, ny);
-    job.resampler.add(nx * this.width, ny * this.height);
+    const t = Math.fround(Math.max(0, p.t - job.t0));
+    job.points.push(nx, ny, t);
+    job.resampler.add(nx * this.width, ny * this.height, t);
   }
 
   private strokeMove(points: InputPoint[]): void {
@@ -288,6 +311,7 @@ export class Engine {
       const job = this.jobs[0]!;
       while (job.qi < job.queue.length && n < budget) {
         job.renderer.stamp(job.queue[job.qi++]!);
+        job.stampsDone++;
         n++;
       }
       if (job.qi < job.queue.length) break;
@@ -296,6 +320,7 @@ export class Engine {
       if (!job.ended) break;
       job.renderer.end();
       this.jobs.shift();
+      if (job.ticks.length > 0) job.cmd.ticks = new Uint32Array(job.ticks);
       this.commit(job.cmd);
     }
     return n;
@@ -318,8 +343,16 @@ export class Engine {
   runAction(actionId: string, settings: SettingValues): void {
     if (this.busy || !this.session) return;
     this.drain();
-    const cmd: ActionCommand = { kind: 'action', action: actionId, settings: structuredClone(settings), seed: randomSeed() };
-    this.apply(cmd);
+    const cmd: ActionCommand = {
+      kind: 'action',
+      action: actionId,
+      settings: structuredClone(settings),
+      seed: randomSeed(),
+      ticksBefore: this.pendingTicks,
+    };
+    this.pendingTicks = 0;
+    // The ticks already happened live; only the action itself is applied now.
+    this.apply({ ...cmd, ticksBefore: 0 });
     this.commit(cmd);
     this.requestFrame();
   }
@@ -342,13 +375,11 @@ export class Engine {
   async redo(): Promise<void> {
     if (this.busy || this.live) return;
     this.drain();
-    const cmd = this.history.commandAt(this.history.cursor);
-    if (!cmd) return;
-    this.apply(cmd);
-    this.history.setCursor(this.history.cursor + 1);
-    if (this.history.checkpointDue()) this.history.addCheckpoint(this.session.snapshot());
+    if (!this.history.canRedo) return;
+    // Rebuild from a checkpoint rather than applying on top of the current state: paint may
+    // have kept flowing since the undo, and replay has to match the original exactly.
+    await this.replayTo(this.history.cursor + 1);
     this.emitHistory();
-    this.requestFrame();
   }
 
   /** Clear the painting (undoable). */
@@ -356,27 +387,49 @@ export class Engine {
     this.runAction('__clear__', {});
   }
 
-  /** Apply one command synchronously. Returns the amount of work done (stamps). */
+  /** Apply one command synchronously, including its recorded simulation ticks. Returns work done. */
   private apply(cmd: Command): number {
+    const sim = this.session.simulation;
+    const tick = () => sim?.tick();
+    const before = cmd.ticksBefore ?? 0;
+    for (let i = 0; i < before; i++) tick();
+    let work = before * 40;
     if (cmd.kind === 'action') {
       if (cmd.action === '__clear__') {
         this.session.reset();
       } else {
         this.session.runAction(cmd.action, cmd.settings, createRandom(cmd.seed));
       }
-      return 500;
+      return work + 500;
     }
     const renderer = this.session.beginStroke(cmd.tool, cmd.settings, createRandom(cmd.seed));
+    const ticks = cmd.ticks ?? new Uint32Array(0);
+    let ti = 0;
     let count = 0;
+    const ticksAt = (n: number) => {
+      while (ti < ticks.length && ticks[ti]! <= n) {
+        tick();
+        ti++;
+        work += 40;
+      }
+    };
+    ticksAt(0);
     const resampler = new StrokeResampler(renderer.spacing, renderer.directionSmoothing, (s) => {
       renderer.stamp(s);
       count++;
+      ticksAt(count);
     });
     const pts = cmd.points;
-    for (let i = 0; i + 1 < pts.length; i += 2) resampler.add(pts[i]! * this.width, pts[i + 1]! * this.height);
+    const stride = cmd.stride ?? 2;
+    for (let i = 0; i + 1 < pts.length; i += stride) {
+      // Old projects have no time; assume ~120 Hz input.
+      const t = stride === 3 ? pts[i + 2]! : (i / stride) * 8;
+      resampler.add(pts[i]! * this.width, pts[i + 1]! * this.height, t);
+    }
     resampler.finish();
+    ticksAt(Infinity);
     renderer.end();
-    return count;
+    return work + count;
   }
 
   /** Bring the canvas to the state after `target` commands, using checkpoints. */
@@ -385,6 +438,8 @@ export class Engine {
     if (plan.checkpoint) this.session.restore(plan.checkpoint);
     else this.session.reset();
     this.history.setCursor(plan.from);
+    this.pendingTicks = 0;
+    this.tickClock = 0;
     this.markDirty({ x: 0, y: 0, w: this.width, h: this.height });
     if (plan.replay.length === 0) {
       this.requestFrame();
@@ -451,16 +506,44 @@ export class Engine {
     // Adapt the per-frame stamp budget to keep the UI at ~60 fps without dropping input.
     if (dt > 24) this.stampsPerFrame = Math.max(80, this.stampsPerFrame * 0.85);
     else if (dt < 19) this.stampsPerFrame = Math.min(6000, this.stampsPerFrame * 1.08);
+    if (this.recognizer.isPending) this.recognizer.poll(performance.now());
     try {
       this.process(Math.round(this.stampsPerFrame));
+      this.simulate(dt);
       this.renderNow();
     } catch (e) {
       this.callbacks.onError?.(e as Error);
     }
-    const pending = this.jobs.some((j) => j.qi < j.queue.length || j.ended);
+    const pending =
+      this.jobs.some((j) => j.qi < j.queue.length || j.ended) ||
+      this.recognizer.isPending ||
+      this.isSettling;
     if (pending) this.requestFrame();
     else this.lastFrame = 0;
   };
+
+  /** True while the style's simulation is still running (e.g. paint flowing). */
+  get isSettling(): boolean {
+    return !this.busy && !!this.session?.simulation?.active;
+  }
+
+  /** Run fixed-rate simulation ticks and record when they happened. */
+  private simulate(dt: number): void {
+    const sim = this.session.simulation;
+    if (!sim || this.busy) return;
+    if (!sim.active) {
+      this.tickClock = 0;
+      return;
+    }
+    this.tickClock = Math.min(this.tickClock + dt, TICK_MS * 2);
+    while (this.tickClock >= TICK_MS && sim.active) {
+      this.tickClock -= TICK_MS;
+      sim.tick();
+      const job = this.jobs[0];
+      if (job) job.ticks.push(job.stampsDone);
+      else this.pendingTicks++;
+    }
+  }
 
   private renderNow(): void {
     const area = clipToBounds(this.dirty, this.width, this.height);

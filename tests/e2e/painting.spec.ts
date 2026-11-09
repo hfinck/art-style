@@ -22,6 +22,12 @@ class Touch {
     await this.cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   }
 
+  async hold([x, y]: Pt, ms: number, page: Page) {
+    await this.cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [this.p([x, y])] });
+    await page.waitForTimeout(ms);
+    await this.cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  }
+
   async twoFingerTap() {
     const a = this.p([0.4, 0.5]);
     const b = this.p([0.6, 0.5]);
@@ -46,13 +52,36 @@ class Touch {
 declare global {
   interface Window {
     __app: {
-      engine: { commands(): unknown[]; readImage(): ImageData; view: { scale: number } } | null;
+      engine: {
+        commands(): unknown[];
+        readImage(): ImageData;
+        view: { scale: number };
+        isSettling: boolean;
+        width: number;
+        height: number;
+      } | null;
       canUndo: { value: boolean };
       busy: { value: boolean };
       error: { value: string | null };
     };
   }
 }
+
+/** Wait until the wet paint has stopped flowing. */
+const settled = (page: Page) =>
+  page.waitForFunction(() => !window.__app.engine!.isSettling && !window.__app.busy.value, null, { timeout: 45_000 });
+
+/** RGB at a normalised canvas position. */
+const pixel = (page: Page, x: number, y: number) =>
+  page.evaluate(
+    ([x, y]) => {
+      const e = window.__app.engine!;
+      const img = e.readImage();
+      const i = (Math.floor(y * e.height) * e.width + Math.floor(x * e.width)) * 4;
+      return [img.data[i]!, img.data[i + 1]!, img.data[i + 2]!];
+    },
+    [x, y],
+  );
 
 const commandCount = (page: Page) => page.evaluate(() => window.__app.engine!.commands().length);
 
@@ -84,8 +113,9 @@ test('the full technique works with touch: splodge, bury, sweep, undo', async ({
   const touch = new Touch(await context.newCDPSession(page), box);
 
   await page.getByRole('button', { name: 'Scatter' }).tap();
-  await touch.drag([[0.5, 0.5], [0.5, 0.5]], 1); // tap = drop a blob
+  await touch.drag([[0.5, 0.5], [0.5, 0.5]], 1); // tap = pour a blob
   await expect.poll(() => commandCount(page)).toBe(2);
+  await settled(page);
   const afterDrop = await colourfulness(page);
   expect(afterDrop).toBeGreaterThan(0.02);
 
@@ -98,6 +128,7 @@ test('the full technique works with touch: splodge, bury, sweep, undo', async ({
   await touch.drag([[0.05, 0.3], [0.5, 0.25], [0.95, 0.35]]);
   await touch.drag([[0.05, 0.7], [0.5, 0.8], [0.95, 0.65]]);
   await expect.poll(() => commandCount(page)).toBe(5);
+  await settled(page);
   const afterSweep = await colourfulness(page);
   expect(afterSweep).toBeGreaterThan(afterCover * 2); // the sweep brings colour back
 
@@ -114,8 +145,73 @@ test('the full technique works with touch: splodge, bury, sweep, undo', async ({
   expect(await page.evaluate(() => window.__app.error.value)).toBeNull();
 });
 
-test('undo/redo replay is exact', async ({ page }) => {
+test('pouring into a puddle pushes the earlier colour outward into a ring', async ({ page, context, isMobile }) => {
+  test.skip(!isMobile, 'touch flow');
   await start(page);
+  const touch = new Touch(await context.newCDPSession(page), (await page.locator('canvas').boundingBox())!);
+  const swatches = page.locator('.swatches .swatch');
+  await swatches.nth(0).tap();
+  await touch.hold([0.5, 0.5], 900, page);
+  await expect.poll(() => commandCount(page)).toBe(1);
+  await settled(page);
+  const first = await pixel(page, 0.5, 0.5);
+  await swatches.nth(2).tap();
+  await touch.hold([0.5, 0.5], 500, page);
+  await expect.poll(() => commandCount(page)).toBe(2);
+  await settled(page);
+  const centre = await pixel(page, 0.5, 0.5);
+  // The centre now shows the second colour…
+  expect(Math.abs(centre[0]! - first[0]!) + Math.abs(centre[1]! - first[1]!) + Math.abs(centre[2]! - first[2]!)).toBeGreaterThan(80);
+  // …and the first colour survives as a ring around it (not mixed away).
+  const ring = await page.evaluate(
+    ([r, g, b]) => {
+      const e = window.__app.engine!;
+      const img = e.readImage();
+      let best = Infinity;
+      for (let d = 0.02; d < 0.45; d += 0.005) {
+        const x = Math.floor((0.5 + d) * e.width);
+        const i = (Math.floor(0.5 * e.height) * e.width + x) * 4;
+        best = Math.min(best, Math.abs(img.data[i]! - r!) + Math.abs(img.data[i + 1]! - g!) + Math.abs(img.data[i + 2]! - b!));
+      }
+      return best;
+    },
+    first,
+  );
+  expect(ring).toBeLessThan(40);
+});
+
+test('holding longer pours a bigger puddle', async ({ page, context, isMobile }) => {
+  test.skip(!isMobile, 'touch flow');
+  await start(page);
+  const touch = new Touch(await context.newCDPSession(page), (await page.locator('canvas').boundingBox())!);
+  await touch.hold([0.3, 0.5], 150, page);
+  await touch.hold([0.75, 0.5], 1500, page);
+  await expect.poll(() => commandCount(page)).toBe(2);
+  await settled(page);
+  const radius = (cx: number) =>
+    page.evaluate((cx) => {
+      const e = window.__app.engine!;
+      const img = e.readImage();
+      let r = 0;
+      for (let d = 0; d < 0.25; d += 0.002) {
+        const i = (Math.floor(0.5 * e.height) * e.width + Math.floor((cx + d) * e.width)) * 4;
+        const [R, G, B] = [img.data[i]!, img.data[i + 1]!, img.data[i + 2]!];
+        if (Math.max(R, G, B) - Math.min(R, G, B) < 40) break;
+        r = d;
+      }
+      return r;
+    }, cx);
+  expect(await radius(0.75)).toBeGreaterThan((await radius(0.3)) * 1.3);
+});
+
+test('undo/redo replay is exact, including flowing paint', async ({ page }) => {
+  await start(page);
+  const box0 = (await page.locator('canvas').boundingBox())!;
+  // A held pour (simulation ticks happen during the stroke) …
+  await page.mouse.move(box0.x + box0.width * 0.3, box0.y + box0.height * 0.3);
+  await page.mouse.down();
+  await page.waitForTimeout(500);
+  await page.mouse.up();
   await page.getByRole('button', { name: 'Scatter' }).click();
   await page.getByRole('button', { name: /Bury/ }).click();
   await page.getByRole('button', { name: 'Cover all' }).click();
@@ -125,7 +221,8 @@ test('undo/redo replay is exact', async ({ page }) => {
   await page.mouse.down();
   for (let i = 1; i <= 30; i++) await page.mouse.move(box.x + box.width * (0.1 + i * 0.027), box.y + box.height * (0.5 + Math.sin(i / 5) * 0.1));
   await page.mouse.up();
-  await expect.poll(() => commandCount(page)).toBe(3);
+  await expect.poll(() => commandCount(page)).toBe(4);
+  await settled(page);
   const hash = () =>
     page.evaluate(() => {
       const d = window.__app.engine!.readImage().data;
@@ -134,12 +231,16 @@ test('undo/redo replay is exact', async ({ page }) => {
       return h;
     });
   const before = await hash();
-  await page.getByRole('button', { name: 'Undo' }).click();
-  await page.getByRole('button', { name: 'Undo' }).click();
-  await expect.poll(() => commandCount(page)).toBe(1);
-  await page.getByRole('button', { name: 'Redo' }).click();
-  await page.getByRole('button', { name: 'Redo' }).click();
-  await expect.poll(() => commandCount(page)).toBe(3);
+  for (let n = 3; n >= 1; n--) {
+    await page.getByRole('button', { name: 'Undo' }).click();
+    await expect.poll(() => commandCount(page)).toBe(n);
+  }
+  await settled(page);
+  for (let n = 2; n <= 4; n++) {
+    await page.getByRole('button', { name: 'Redo' }).click();
+    await expect.poll(() => commandCount(page)).toBe(n);
+  }
+  await settled(page);
   expect(await hash()).toBe(before);
 });
 

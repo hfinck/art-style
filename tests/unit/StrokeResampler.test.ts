@@ -51,4 +51,28 @@ describe('StrokeResampler', () => {
       Math.max(...st.slice(1).map((s) => Math.acos(Math.min(1, s.dirX * s.prevDirX + s.dirY * s.prevDirY))));
     expect(maxTurn(smooth)).toBeLessThan(maxTurn(sharp));
   });
+
+  it('interpolates time along the path', () => {
+    const out: Stamp[] = [];
+    const r = new StrokeResampler(2, 0, (s) => out.push(s));
+    r.add(0, 0, 0);
+    r.add(50, 0, 100);
+    r.add(100, 0, 200);
+    r.finish();
+    const mid = out.find((s) => Math.abs(s.x - 50) < 1)!;
+    expect(mid.time).toBeGreaterThan(90);
+    expect(mid.time).toBeLessThan(110);
+    for (let i = 1; i < out.length; i++) expect(out[i]!.time).toBeGreaterThanOrEqual(out[i - 1]!.time);
+  });
+
+  it('emits the first stamp immediately when the tool does not smooth direction (press and hold)', () => {
+    const out: Stamp[] = [];
+    const r = new StrokeResampler(2, 0, (s) => out.push(s));
+    r.add(10, 10, 0);
+    expect(out).toHaveLength(1);
+    const smoothed: Stamp[] = [];
+    const r2 = new StrokeResampler(2, 20, (s) => smoothed.push(s));
+    r2.add(10, 10, 0);
+    expect(smoothed).toHaveLength(0); // waits for a direction
+  });
 });
