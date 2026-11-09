@@ -1,6 +1,9 @@
 # Art Style Studio — Architecture & Implementation Plan
 
-> Status: **proposal, awaiting approval**. Nothing is implemented yet.
+> Status: **approved and implemented (v0.1)**.
+> Decisions: Preact; GitHub Pages; guided phases; multiple canvas formats; finger input (no stylus-specific features).
+> Deviations from the proposal: the boundary rule is enforced by `scripts/check-boundaries.mjs` instead of ESLint;
+> export is at simulation resolution, and high-res export by replay is not implemented yet.
 
 ## 1. Goal
 
