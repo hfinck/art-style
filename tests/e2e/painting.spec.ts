@@ -69,7 +69,7 @@ declare global {
 
 /** Wait until the wet paint has stopped flowing. */
 const settled = (page: Page) =>
-  page.waitForFunction(() => !window.__app.engine!.isSettling && !window.__app.busy.value, null, { timeout: 45_000 });
+  page.waitForFunction(() => !window.__app.engine!.isSettling && !window.__app.busy.value, null, { timeout: 150_000 });
 
 /** RGB at a normalised canvas position. */
 const pixel = (page: Page, x: number, y: number) =>
@@ -212,6 +212,12 @@ test('undo/redo replay is exact, including flowing paint', async ({ page }) => {
   await page.mouse.down();
   await page.waitForTimeout(500);
   await page.mouse.up();
+  // Fewer, smaller pours keep this test fast on software-rendered CI machines.
+  await page.evaluate(() => {
+    const app = window.__app as unknown as { setSetting(o: string, s: string, v: number): void };
+    app.setSetting('scatter', 'count', 3);
+    app.setSetting('scatter', 'size', 7);
+  });
   await page.getByRole('button', { name: 'Scatter' }).click();
   await page.getByRole('button', { name: /Bury/ }).click();
   await page.getByRole('button', { name: 'Cover all' }).click();

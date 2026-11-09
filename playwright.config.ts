@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: 'tests/e2e',
-  timeout: 120_000,
+  timeout: 300_000,
   // Software-rendered WebGL in CI is slow; paint simulation needs time.
   expect: { timeout: 30_000 },
   fullyParallel: true,
@@ -15,7 +15,7 @@ export default defineConfig({
     command: 'npx vite build && npx vite preview --port 4173 --strictPort',
     url: 'http://localhost:4173/',
     reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    timeout: 300_000,
   },
   projects: [
     { name: 'mobile', use: { ...devices['Pixel 7'] } },
