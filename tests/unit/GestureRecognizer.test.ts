@@ -123,4 +123,15 @@ describe('GestureRecognizer', () => {
     g.up(1, 900);
     expect(log).toEqual(['start', 'end']);
   });
+
+  it('a two-finger tap still undoes when a slow frame started a press first', () => {
+    const { g, log } = setup();
+    g.down(1, pt(0, 0, 0));
+    g.poll(90); // frame ran late: the still finger became a stroke
+    g.down(2, pt(50, 0, 95));
+    g.up(1, 150);
+    g.up(2, 160);
+    expect(log).toContain('cancel');
+    expect(log).toContain('tap2');
+  });
 });

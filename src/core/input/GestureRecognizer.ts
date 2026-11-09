@@ -43,7 +43,13 @@ export const DEFAULT_GESTURE_OPTIONS: GestureOptions = {
 type State =
   | { kind: 'idle' }
   | { kind: 'pending'; id: number; points: InputPoint[] }
-  | { kind: 'stroke'; id: number; last: InputPoint }
+  | {
+      kind: 'stroke';
+      id: number;
+      last: InputPoint;
+      /** Started from a finger held still (poll) and not moved since: still ambiguous. */
+      still: boolean;
+    }
   | { kind: 'pan'; id: number; last: InputPoint }
   | {
       kind: 'multi';
@@ -82,7 +88,7 @@ export class GestureRecognizer {
     if (kind === 'mouse') {
       if (s.kind !== 'idle') return;
       if (button === 0) {
-        this.state = { kind: 'stroke', id, last: p };
+        this.state = { kind: 'stroke', id, last: p, still: false };
         this.h.strokeStart(p);
       } else {
         this.state = { kind: 'pan', id, last: p };
@@ -101,7 +107,9 @@ export class GestureRecognizer {
       }
       case 'stroke':
         this.h.strokeCancel();
-        this.toMulti(new Map([[s.id, s.last], [id, p]]), p.t, true);
+        // A press that has not moved yet can still become a multi-finger tap (on a slow
+        // frame the hold timer may fire before the second finger's event is delivered).
+        this.toMulti(new Map([[s.id, s.last], [id, p]]), s.still ? s.last.t : p.t, !s.still);
         return;
       case 'multi':
         s.pointers.set(id, p);
@@ -123,7 +131,7 @@ export class GestureRecognizer {
         const last = s.points[s.points.length - 1]!;
         const moved = Math.hypot(last.x - first.x, last.y - first.y);
         if (moved >= this.opts.slopPx || last.t - first.t >= this.opts.holdMs) {
-          this.state = { kind: 'stroke', id, last };
+          this.state = { kind: 'stroke', id, last, still: false };
           this.h.strokeStart(first);
           if (s.points.length > 1) this.h.strokeMove(s.points.slice(1));
         }
@@ -131,7 +139,11 @@ export class GestureRecognizer {
       }
       case 'stroke':
         if (id !== s.id) return;
-        s.last = points[points.length - 1]!;
+        {
+          const next = points[points.length - 1]!;
+          if (s.still && Math.hypot(next.x - s.last.x, next.y - s.last.y) >= this.opts.slopPx) s.still = false;
+          if (!s.still) s.last = next;
+        }
         this.h.strokeMove(points);
         return;
       case 'pan': {
@@ -173,7 +185,7 @@ export class GestureRecognizer {
     if (s.kind !== 'pending') return;
     const first = s.points[0]!;
     if (t - first.t < this.opts.holdMs) return;
-    this.state = { kind: 'stroke', id: s.id, last: s.points[s.points.length - 1]! };
+    this.state = { kind: 'stroke', id: s.id, last: s.points[s.points.length - 1]!, still: true };
     this.h.strokeStart(first);
     if (s.points.length > 1) this.h.strokeMove(s.points.slice(1));
   }
