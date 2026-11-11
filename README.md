@@ -7,8 +7,9 @@ A mobile-first web app for painting in artist-inspired styles. Each style is a p
    Pouring into a puddle pushes the earlier colours outward into rings without mixing them,
    and puddles keep spreading for a moment afterwards. *Scatter* pours several ring stacks at once.
 2. **Bury** (optional): pour white over them (*Pour* or *Cover all*).
-3. **Sweep**: drag a broad brush through the wet paint. Each bristle carries the colour it picked up,
-   so ring stacks are pulled into long, pure, parallel bands. Fast strokes and sharp turns fling
+3. **Sweep**: drag a broad brush through the wet paint. It pushes a bead of wet paint that mixes with
+   the puddles it crosses and slowly spreads along the brush, while colours dragged in the bristles
+   stretch into streaks. Fast strokes and sharp turns fling
    splashes of the carried paint outward.
 
 ## Use
@@ -59,7 +60,7 @@ Key ideas:
 - **GPU paint model.** Paint is two wet layers (top + buried) of colour and thickness in half-float textures. Lighting from the paint height gives the glossy look.
   - *Pouring* is an area-preserving radial push: new paint appears at the centre and existing paint moves outward, so colours form rings instead of mixing.
   - *Spreading* stretches a puddle around its pour point and eases out. Rings stay crisp and get thinner.
-  - *Sweeping* uses a paint-history ring buffer per bristle (sample and hold): each bristle lays down the colour it picked up at its last reload, which gives pure parallel bands. Speed and turning rate (from timestamped input) drive momentum splashes.
+  - *Sweeping* scrapes most of the paint under the brush off the canvas (a thin mark of what was there stays) and carries it in two places, per bristle. The *bead* in front of the brush is a body of liquid: it mixes what it picks up (by volume, weighted by tinting strength), flows sideways from high to low (faster the more paint there is, and less per distance on fast strokes), lays down a film that thins as it runs out (dry-brush streaks), and is partly left behind as a mound when the brush lifts. The *grooves* between bristles release what they drew in evenly over a delay that varies across the brush, which stretches colours into pure streaks without mixing neighbouring lines (a ring buffer of per-step intake). Speed and turning rate (from timestamped input) drive momentum splashes.
 - **Time-based simulation with exact replay.** Styles can expose a `simulation` that the core ticks at a fixed 30 Hz. The engine records when each tick happened relative to commands and stamps, so undo/redo and loading replay the flowing paint exactly.
 - **Touch first.** Browser gestures are blocked on the canvas. A short delay before painting starts lets a second finger turn the touch into navigation without leaving a mark. Lost GPU contexts are rebuilt by replaying the command log.
 

@@ -122,13 +122,16 @@ float bristleNoise(float u) {
 }
 `;
 
-/** Organic outline: radius multiplier for an angle. */
+/**
+ * Organic outline: radius multiplier for an angle. Surface tension keeps liquid acrylic
+ * nearly round, so only gentle low-frequency deviations.
+ */
 const WOBBLE = /* glsl */ `
 uniform vec4 uPhase;
 uniform float uWobble;
 float wobble(float ang) {
-  return 1.0 + uWobble * (0.09 * sin(3.0 * ang + uPhase.x) + 0.06 * sin(5.0 * ang + uPhase.y)
-       + 0.03 * sin(9.0 * ang + uPhase.z) + 0.015 * sin(14.0 * ang + uPhase.w));
+  return 1.0 + uWobble * (0.035 * sin(2.0 * ang + uPhase.x) + 0.025 * sin(3.0 * ang + uPhase.y)
+       + 0.008 * sin(5.0 * ang + uPhase.z));
 }
 `;
 
@@ -231,7 +234,7 @@ void main() {
   float soft = 1.5 / max(min(uRadii.x, uRadii.y), 1.0);
   float cov = 1.0 - smoothstep(1.0 - soft, 1.0, e);
   vec4 B = texelFetch(uHistory, ivec2(int(clamp(uU, 0.0, 0.9999) * uCount), int(uRow)), 0);
-  cov *= clamp(B.a * 8.0, 0.0, 1.0);
+  cov *= clamp(B.a * 60.0, 0.0, 1.0);
   float h = uAmount * sqrt(max(0.0, 1.0 - e * e));
   top.rgb = mix(top.rgb, B.rgb, cov);
   top.a = mix(top.a, clamp(max(top.a, h + top.a * 0.3), 0.0, 1.0), cov);
@@ -278,155 +281,284 @@ void main() {
 }`;
 
 /**
- * Sweep, pass 1: every bristle records what it picks up at this step into one row of the
- * brush's paint history (a ring buffer of rows).
+ * Mixing wet paint by volume, weighted by tinting strength: a little saturated colour
+ * stains a lot of white, as with real pigments.
+ */
+const PAINT_MIX = /* glsl */ `
+float tint(vec3 c) {
+  return 1.0 + 5.0 * (max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b)));
+}
+vec3 mixPaint(vec3 a, float va, vec3 b, float vb) {
+  float wa = max(va, 0.0) * tint(a);
+  float wb = max(vb, 0.0) * tint(b);
+  return wa + wb > 1e-7 ? (a * wa + b * wb) / (wa + wb) : a;
+}
+`;
+
+/**
+ * The brush model shared by the sweep passes. The brush carries paint in two places, per
+ * bristle (colour + volume; volume in thickness·px per px of brush width, divided by the brush
+ * width):
+ * - the bead of liquid paint in front of it, which mixes and flows along the brush;
+ * - the grooves between the bristles: paint drawn into a groove comes out behind the brush in
+ *   the same order, unmixed, after a delay that differs from bristle to bristle. Neighbouring
+ *   lines of the stroke therefore show colours from different points along the path: pure,
+ *   fine streaks that stretch what the brush crossed.
+ * At each step the brush scrapes most of the paint under it off the canvas: a little slips
+ * straight under it, the rest is shared between grooves and bead. Behind the brush both leave a
+ * film; the bead's is thicker the larger the bead is, and a bead larger than the brush can push
+ * spills under it.
+ */
+const BRUSH = /* glsl */ `
+uniform float uDepth;
+uniform float uStreak;
+uniform float uScrape;     // share of the paint under the brush that it moves
+uniform float uPass;       // share of the scraped paint that slips under the brush at once
+uniform float uGroove;     // share of the scraped paint that goes into the grooves
+uniform float uFilm;       // film thickness a well-loaded bead leaves behind
+uniform float uHalf;       // bead volume at which that film is half as thick
+uniform float uCapacity;   // bead volume the brush can push
+float brushEdge(float u) {
+  return smoothstep(0.0, 0.035, u) * (1.0 - smoothstep(0.965, 1.0, u));
+}
+/** Paint the brush moves at one spot (rgb, amount); how deep into the buried layer it reaches. */
+vec4 contact(vec4 top, vec4 under, float n, float edge, out float reach, out float scrape) {
+  float D = clamp(uDepth * mix(1.0, 0.35 + 1.3 * n, uStreak * 0.7), 0.0, 1.0);
+  reach = revealAmount(top.a, under.a, D);
+  scrape = uScrape * edge * mix(1.0, 0.7 + 0.6 * n, uStreak * 0.5);
+  return vec4(mix(top.rgb, under.rgb, reach), scrape * (top.a + reach * under.a));
+}
+float beadFilm(float bead, float n) {
+  float f = min(1.0, uFilm * bead / (bead + uHalf) + 8.0 * max(bead - uCapacity, 0.0));
+  // A bead running low only leaves paint with the fuller bristles (dry-brush streaks).
+  float wet = 1.0 - clamp(f / 0.03, 0.0, 1.0);
+  return f * smoothstep(wet - 0.15, wet + 0.1, n);
+}
+`;
+
+/**
+ * Sweep, pass 1: update the paint on the brush. One row per step of a ring buffer:
+ * attachment 0 = the bead after this step, 1 = the paint drawn into the grooves at this step
+ * (rgb, thickness). The bead flows sideways like a liquid: from
+ * where it is high to where it is low, faster the more paint there is, so a big blob spreads
+ * along the brush over some distance while a thin film hardly moves. Then the brush takes up
+ * the paint scraped off the canvas and pays out the film.
  */
 export const PICKUP_FS =
   HEADER +
   /* glsl */ `
 uniform highp sampler2D uSrc0;
-uniform highp sampler2D uSrc1;
+uniform highp sampler2D uPaint0;
+uniform highp sampler2D uPaint1;
+uniform vec2 uSize;
+uniform vec3 uBg;
 uniform float uCount;
+uniform float uPrevRow;
+uniform float uFresh;
+uniform float uFlow;      // sideways exchange per step between neighbours of a full bead
+uniform float uMobile;    // bead volume from which it flows freely
+uniform float uStepFrac;  // step length / brush width
 uniform vec2 uPrevPos;
 uniform vec2 uCurPos;
 uniform vec2 uPrevNormal;
 uniform vec2 uCurNormal;
-uniform float uDepth;
-uniform vec3 uBg;
-out vec4 oPicked;
+layout(location = 0) out vec4 oBead;
+layout(location = 1) out vec4 oGroove;
 ` +
   COMMON +
-  FETCH +
+  BRISTLES +
+  PAINT_MIX +
+  BRUSH +
   /* glsl */ `
-uniform float uWidthPx;
+vec4 paintAt(highp sampler2D tex, vec2 p) {
+  return texelFetch(tex, clamp(ivec2(floor(p)), ivec2(0), ivec2(uSize) - 1), 0);
+}
+vec4 bead(int i) {
+  return texelFetch(uSrc0, ivec2(i, int(uPrevRow)), 0);
+}
 void main() {
-  float u = (floor(vPos.x) + 0.5) / uCount;
+  int idx = int(floor(vPos.x));
+  int count = int(uCount);
+  if (uFresh > 0.5) {
+    oBead = oGroove = vec4(uBg, 0.0);
+    return;
+  }
+
+  // Pairwise exchange (antisymmetric, so no paint is created or lost; none leaves the brush).
+  vec4 own = bead(idx);
+  float gain = 0.0, loss = 0.0;
+  vec3 inCol = vec3(0.0);
+  for (int k = -8; k <= 8; k++) {
+    int j = idx + k;
+    if (k == 0 || j < 0 || j >= count) continue;
+    vec4 nb = bead(j);
+    float mobility = clamp(0.5 * (own.a + nb.a) / uMobile, 0.0, 1.0);
+    float f = uFlow * mobility * (nb.a - own.a);
+    if (f > 0.0) {
+      gain += f;
+      inCol += nb.rgb * f;
+    } else {
+      loss -= f;
+    }
+  }
+  float v = own.a + gain - loss;
+  vec3 col = gain > 1e-7 ? mixPaint(own.rgb, own.a - loss, inCol / gain, gain) : own.rgb;
+
+  float u = (float(idx) + 0.5) / uCount;
+  float n = bristleNoise(u);
+  float edge = brushEdge(u);
   float off = (u - 0.5) * uWidthPx;
   vec2 a = uPrevPos + uPrevNormal * off;
   vec2 b = uCurPos + uCurNormal * off;
-  vec3 col = vec3(0.0);
-  float amount = 0.0;
+  vec3 sc = vec3(0.0);
+  float sa = 0.0;
   for (int k = 0; k < 3; k++) {
     vec2 p = mix(a, b, (float(k) + 0.5) / 3.0);
-    vec4 t = fetchTop(p);
-    vec4 un = fetchUnder(p);
-    float r = revealAmount(t.a, un.a, uDepth);
-    float am = t.a + r * un.a;
-    col += mix(t.rgb, un.rgb, r) * am;
-    amount += am;
+    float reach, scrape;
+    vec4 c = contact(paintAt(uPaint0, p), paintAt(uPaint1, p), n, edge, reach, scrape);
+    sc += c.rgb * c.a;
+    sa += c.a;
   }
-  oPicked = vec4(amount > 1e-5 ? col / amount : uBg, amount / 3.0);
+  sa /= 3.0;
+  vec3 scraped = sa > 1e-6 ? sc / (3.0 * sa) : col;
+  float kept = max(v - beadFilm(v, n) * edge * uStepFrac, 0.0);
+  float taken = (1.0 - uPass - uGroove) * sa * uStepFrac;
+  oBead = vec4(mixPaint(col, kept, scraped, taken), kept + taken);
+  oGroove = vec4(scraped, uGroove * sa);
 }`;
 
-/**
- * Sample and hold: each bristle keeps laying down the colour it picked up at its last
- * "reload" and reloads periodically. Neighbouring bristles reload at slightly different
- * moments, so they hold different colours: long, pure, parallel bands along the stroke.
- */
-const CONVEYOR = /* glsl */ `
+/** The paint on the brush at position u, interpolated between bristles. */
+const BEAD = /* glsl */ `
 uniform highp sampler2D uHistory;
+uniform highp sampler2D uGrooves;
 uniform float uCount;
-uniform float uRows;
-uniform float uStep;
-uniform float uLagMax;
-vec4 carriedAt(float idx, out float age) {
-  float coarse = vnoise2(vec2(idx / uCount * 3.0 + uSeed, 3.7));
-  float fine = hash11(idx * 1.37 + uSeed);
-  float period = max(4.0, uLagMax * (0.4 + 0.6 * coarse));
-  float offset = period * fract(coarse * 1.3) + period * fine * 0.06 * uStreak;
-  float reload = floor((uStep - offset) / period) * period + offset;
-  float oldest = max(uStep - uRows + 1.0, 0.0);
-  reload = clamp(reload, oldest, uStep);
-  age = (uStep - reload) / period;
-  vec4 now = texelFetch(uHistory, ivec2(int(idx), int(mod(reload, uRows))), 0);
-  // Blend from the previously held colour over the first part of the period (no hard ends).
-  float prev = reload - period;
-  if (prev < oldest) return now;
-  vec4 before = texelFetch(uHistory, ivec2(int(idx), int(mod(prev, uRows))), 0);
-  float b = smoothstep(0.0, 0.18, age);
-  if (before.a < 1e-4) return now;
-  if (now.a < 1e-4) return vec4(before.rgb, before.a * (1.0 - b));
-  return mix(before, now, b);
-}
-// Neighbouring bristles reload together (broad ribbons); the streak setting adds a little
-// per-bristle variation (fine lines inside the ribbons). Interpolated between bristles so
-// colour boundaries are smooth instead of stair-stepped.
-vec4 carried(float u, out float age) {
+uniform float uRow;
+vec4 brushRow(highp sampler2D tex, float u, float row) {
   float x = clamp(u, 0.0, 1.0) * uCount - 0.5;
   float i0 = clamp(floor(x), 0.0, uCount - 1.0);
   float i1 = min(i0 + 1.0, uCount - 1.0);
   float f = clamp(x - i0, 0.0, 1.0);
-  float a0, a1;
-  vec4 c0 = carriedAt(i0, a0);
-  vec4 c1 = carriedAt(i1, a1);
-  age = mix(a0, a1, f);
-  float h = mix(c0.a, c1.a, f);
-  vec3 col = h > 1e-5 ? (c0.rgb * c0.a * (1.0 - f) + c1.rgb * c1.a * f) / h : c0.rgb;
-  return vec4(col, h);
+  vec4 c0 = texelFetch(tex, ivec2(int(i0), int(row)), 0);
+  vec4 c1 = texelFetch(tex, ivec2(int(i1), int(row)), 0);
+  return vec4(mixPaint(c0.rgb, c0.a * (1.0 - f), c1.rgb, c1.a * f), mix(c0.a, c1.a, f));
+}
+vec4 brushAt(highp sampler2D tex, float u) {
+  return brushRow(tex, u, uRow);
 }
 `;
 
 /**
- * Sweep, pass 2: lay down paint the bristles picked up earlier along the stroke (a conveyor,
- * not an average, so colours stay pure and rings get stretched into bands), lift buried
- * colour, and level the surface.
+ * Groove paint due behind the brush at u. A line of bristles releases what it drew in evenly
+ * over its delay, so its paint is stretched over that distance without being mixed with the
+ * neighbouring lines. Delays vary in broad ribbons across the brush plus a little per line
+ * (the streak setting).
+ */
+const GROOVES = /* glsl */ `
+uniform float uStep;
+uniform float uRows;
+uniform float uLagMax;
+const int GROOVE_TAPS = 8;
+vec4 grooveDue(float u) {
+  float line = floor(u * uWidthPx / 3.0);
+  float coarse = 0.65 * vnoise2(vec2(u * 6.0 + uSeed, 1.3)) + 0.35 * vnoise2(vec2(u * 40.0 - uSeed, 2.9));
+  float fine = hash11(line * 1.37 + uSeed);
+  float d = mix(coarse, fine, 0.5 * uStreak);
+  float lag = max(1.0, uLagMax * (0.15 + 0.85 * d * d));
+  vec3 col = vec3(0.0);
+  float amount = 0.0, weight = 0.0;
+  for (int k = 0; k < GROOVE_TAPS; k++) {
+    float drawn = floor(uStep - lag * (float(k) + 0.5) / float(GROOVE_TAPS));
+    if (drawn < 0.0) continue;
+    vec4 g = brushRow(uGrooves, u, mod(drawn, uRows));
+    float w = g.a * tint(g.rgb);
+    col += g.rgb * w;
+    weight += w;
+    amount += g.a;
+  }
+  return vec4(weight > 1e-7 ? col / weight : vec3(0.0), amount / float(GROOVE_TAPS));
+}
+`;
+
+/**
+ * Sweep, pass 2: the canvas side of pass 1. The brush scrapes the paint off (leaving a thin
+ * mark of what was there and lifting buried colour it reaches), lets part of it slip
+ * underneath, and lays the film from grooves and bead on top, with fine ridges.
  */
 export const DEPOSIT_FS =
   HEADER +
   STATE_IO +
   /* glsl */ `
-uniform float uDepth;
-uniform float uDeposit;
-uniform float uStreak;
 uniform float uRidge;
 uniform float uMargin;
 ` +
   COMMON +
   BRISTLES +
-  CONVEYOR +
+  PAINT_MIX +
+  BRUSH +
+  BEAD +
+  GROOVES +
   /* glsl */ `
 void main() {
   ivec2 ip = ivec2(floor(vPos));
   vec4 top = texelFetch(uSrc0, ip, 0);
   vec4 under = texelFetch(uSrc1, ip, 0);
   float u = vAttr.x;
-  float age;
-  vec4 B = carried(u, age);
-  // A bristle slowly runs dry until it reloads.
-  B.a *= 1.0 - 0.45 * age;
+  vec4 B = brushAt(uHistory, u);
 
   if (u < 0.0 || u > 1.0) {
     // Just outside the brush: paint pushed aside forms a soft ridge.
     float d = u < 0.0 ? -u : u - 1.0;
-    float bump = 1.0 - smoothstep(0.0, uMargin, d);
-    top.a = clamp(top.a + uRidge * 0.035 * bump * clamp(B.a * 4.0, 0.0, 1.0), 0.0, 1.0);
-    top.rgb = mix(top.rgb, B.rgb, 0.25 * bump * uRidge * clamp(B.a * 8.0, 0.0, 1.0));
+    float bump = (1.0 - smoothstep(0.0, uMargin, d)) * uRidge * clamp(B.a / uHalf * 3.0, 0.0, 1.0);
+    top.rgb = mixPaint(top.rgb, top.a, B.rgb, 0.03 * bump);
+    top.a = clamp(top.a + 0.035 * bump, 0.0, 1.0);
     oTop = top;
     oUnder = under;
     return;
   }
 
-  float edge = smoothstep(0.0, 0.035, u) * (1.0 - smoothstep(0.965, 1.0, u));
   float n = bristleNoise(u);
-  float D = clamp(uDepth * mix(1.0, 0.35 + 1.3 * n, uStreak * 0.7), 0.0, 1.0);
-  float r = revealAmount(top.a, under.a, D);
-  vec3 exposed = mix(top.rgb, under.rgb, r);
-  float dep = uDeposit * edge * mix(1.0, 0.6 + 0.8 * n, uStreak * 0.5) * clamp(B.a * 10.0, 0.0, 1.0);
-  dep = clamp(dep, 0.0, 1.0);
-  vec3 col = mix(exposed, B.rgb, dep);
-
-  // Buried paint that the brush reached is mixed into the top layer.
-  float lift = r * edge;
-  float hu = under.a * (1.0 - lift);
-  float ht = top.a + under.a * lift;
-  // The brush levels the whole surface towards the paint it carries, with fine grooves.
-  float total = ht + hu;
-  float levelled = mix(total, max(B.a, hu + 0.02), 0.85 * edge * clamp(B.a * 10.0, 0.0, 1.0));
-  // A brush never scrapes existing paint completely off the canvas.
-  ht = max(levelled - hu, min(top.a, 0.05));
-  ht += (n - 0.5) * uStreak * 0.05 * edge;
+  float edge = brushEdge(u);
+  float reach, scrape;
+  vec4 c = contact(top, under, n, edge, reach, scrape);
+  float rest = top.a * (1.0 - scrape);
+  float through = uPass * c.a;
+  vec4 G = grooveDue(u);
+  float fb = beadFilm(B.a, n) * edge;
+  float fg = G.a * edge;
+  vec3 col = mixPaint(top.rgb, rest, c.rgb, through);
+  col = mixPaint(col, rest + through, B.rgb, fb);
+  col = mixPaint(col, rest + through + fb, G.rgb, fg);
+  float ht = rest + through + fb + fg + (n - 0.5) * uStreak * 0.04 * edge;
+  float hu = under.a * (1.0 - reach * scrape);
   oTop = vec4(col, clamp(ht, 0.0, 1.0));
   oUnder = vec4(under.rgb, clamp(hu, 0.0, 1.0));
+}`;
+
+/** Lifting the brush leaves part of its bead behind as a low mound just ahead of it. */
+export const RELEASE_FS =
+  HEADER +
+  STATE_IO +
+  /* glsl */ `
+uniform float uWidthPx;
+uniform float uMaxLength;
+` +
+  COMMON +
+  PAINT_MIX +
+  BEAD +
+  /* glsl */ `
+void main() {
+  ivec2 ip = ivec2(floor(vPos));
+  vec4 top = texelFetch(uSrc0, ip, 0);
+  vec4 under = texelFetch(uSrc1, ip, 0);
+  vec4 B = brushAt(uHistory, vAttr.x);
+  float area = 0.2 * B.a * uWidthPx;  // thickness·px per px of brush width
+  float len = clamp(area / 0.2, 0.3 * uMaxLength, uMaxLength) * (0.7 + 0.6 * vnoise1(vAttr.x * 12.0));
+  float t = vAttr.y / len;
+  float h = t >= 0.0 && t < 1.0 ? 1.5 * (area / len) * (1.0 - (2.0 * t - 1.0) * (2.0 * t - 1.0)) : 0.0;
+  h *= smoothstep(0.0, 0.02, vAttr.x) * (1.0 - smoothstep(0.98, 1.0, vAttr.x));
+  top.rgb = mixPaint(top.rgb, top.a, B.rgb, h);
+  oTop = vec4(top.rgb, clamp(top.a + h, 0.0, 1.0));
+  oUnder = under;
 }`;
 
 /** Final image: colour from both layers, lit by the paint relief for a glossy look. */

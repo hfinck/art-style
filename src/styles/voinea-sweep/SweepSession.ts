@@ -21,14 +21,17 @@ import {
   DROPLET_FS,
   INJECT_FS,
   PICKUP_FS,
+  RELEASE_FS,
   POUR_FS,
   RENDER_FS,
   SPREAD_FS,
 } from './shaders';
 
 const BRISTLES = 192;
-/** Rows of brush paint history (one per stamp); bounds the longest smear. */
+/** Rows of brush paint history (one per step, ring buffer); bounds the longest groove delay. */
 const HISTORY = 512;
+/** Bead volume the brush can push before paint spills under it (see shaders BRUSH). */
+const BEAD_CAPACITY = 0.12;
 
 type RGB = [number, number, number];
 
@@ -102,7 +105,7 @@ export class SweepSession implements StyleSession, Simulation {
   private readonly paint: GpuTarget;
   /** Second state buffer for passes that read far-away pixels (flow, pour push). */
   private readonly back: GpuTarget;
-  /** The brush's paint history: one row of bristles per stamp (ring buffer). */
+  /** The paint on the brush per step and bristle: bead in front (0), drawn into the grooves (1). */
   private readonly history: GpuTarget;
   private readonly inject: GpuProgram;
   private readonly spread: GpuProgram;
@@ -110,6 +113,7 @@ export class SweepSession implements StyleSession, Simulation {
   private readonly pour: GpuProgram;
   private readonly pickup: GpuProgram;
   private readonly deposit: GpuProgram;
+  private readonly release: GpuProgram;
   private readonly composite: GpuProgram;
   private readonly bg = hexToRgb(CANVAS);
   private readonly white = hexToRgb(WHITE);
@@ -122,20 +126,27 @@ export class SweepSession implements StyleSession, Simulation {
     this.shortSide = Math.min(width, height);
     this.paint = gpu.createTarget(width, height, { attachments: 2, format });
     this.back = gpu.createTarget(width, height, { attachments: 2, format });
-    this.history = gpu.createTarget(BRISTLES, HISTORY, { attachments: 1, format });
+    this.history = gpu.createTarget(BRISTLES, HISTORY, { attachments: 2, format });
     this.inject = gpu.createProgram(INJECT_FS);
     this.spread = gpu.createProgram(SPREAD_FS);
     this.droplet = gpu.createProgram(DROPLET_FS);
     this.pour = gpu.createProgram(POUR_FS);
     this.pickup = gpu.createProgram(PICKUP_FS);
     this.deposit = gpu.createProgram(DEPOSIT_FS);
+    this.release = gpu.createProgram(RELEASE_FS);
     this.composite = gpu.createProgram(RENDER_FS);
     const size = [width, height];
     for (const p of [this.inject, this.spread, this.pickup, this.composite]) {
       p.setUniforms({ uSize: size, uBg: this.bg });
     }
     this.pickup.setUniforms({ uCount: BRISTLES });
-    this.deposit.setUniforms({ uCount: BRISTLES, uRows: HISTORY, uHistory: this.history.textures[0]! });
+    this.deposit.setUniforms({
+      uCount: BRISTLES,
+      uRows: HISTORY,
+      uHistory: this.history.textures[0]!,
+      uGrooves: this.history.textures[1]!,
+    });
+    this.release.setUniforms({ uCount: BRISTLES });
     this.droplet.setUniforms({ uCount: BRISTLES, uHistory: this.history.textures[0]! });
     this.composite.setUniforms({ uGloss: 0.6, uRelief: 26 });
   }
@@ -259,7 +270,8 @@ export class SweepSession implements StyleSession, Simulation {
       uReach1: reach1,
       uColor: src.color,
       uAmount: src.amount,
-      uWobble: 1,
+      // Many overlapping wobbly pushes along a trail would scallop its edges.
+      uWobble: reachRadius === undefined ? 1 : 0,
       uPhase: src.phase,
     });
     const rect = { x: x - pad, y: y - pad, w: pad * 2, h: pad * 2 };
@@ -334,7 +346,7 @@ export class SweepSession implements StyleSession, Simulation {
   private dropStroke(settings: SettingValues, rng: Random): StrokeRenderer {
     const variation = num(settings, 'variation', 30) / 100;
     const radius = (num(settings, 'size', 10) / 100) * this.shortSide * 0.5 * (1 + rng.range(-0.5, 0.5) * variation);
-    const spacing = Math.max(2, radius * 0.12);
+    const spacing = Math.max(2, radius * 0.06);
     const session = this;
     let source: PourSource | null = null;
     return {
@@ -444,23 +456,36 @@ export class SweepSession implements StyleSession, Simulation {
     const margin = Math.max(3, width * 0.03);
     const depth = num(settings, 'depth', 65) / 100;
     const splash = num(settings, 'splash', 55) / 100;
-    const lagMax = Math.min(HISTORY - 1, Math.round(smearPx / spacing));
     const seed = rng.range(0, 50);
     const gpu = this.ctx.gpu;
+    const stepFrac = spacing / width;
+    const film = 0.35 * (num(settings, 'coverage', 92) / 100);
 
     // Programs are shared between strokes, so per-stroke uniforms are applied on every stamp
     // (a new stroke may begin while the previous one still has queued stamps).
-    const pickupUniforms = { uWidthPx: width, uDepth: depth };
-    const depositUniforms = {
+    const brushUniforms = {
       uWidthPx: width,
       uDepth: depth,
-      uDeposit: num(settings, 'coverage', 92) / 100,
       uStreak: num(settings, 'streaks', 50) / 100,
+      uSeed: seed,
+      uScrape: 0.62 + 0.33 * depth,
+      uPass: 0.06,
+      uGroove: 0.65,
+      uFilm: film,
+      // Over bare canvas the bead runs out over roughly a third of the smear length.
+      uHalf: (film * smearPx * 0.3) / width,
+      uCapacity: BEAD_CAPACITY,
+      uMobile: 0.04,
+      uStepFrac: stepFrac,
+    };
+    const depositUniforms = {
       uRidge: num(settings, 'ridges', 45) / 100,
       uMargin: margin / width,
-      uSeed: seed,
-      uLagMax: lagMax,
+      uLagMax: Math.min(HISTORY - 1, Math.round(smearPx / spacing)),
     };
+    // A full bead spreads along the brush by about a quarter of its width (standard deviation)
+    // per brush width travelled; the pairwise scheme is stable up to 1/16.
+    const flow = Math.min(1 / 16, ((0.25 * BRISTLES) ** 2 * stepFrac) / 408);
 
     // Momentum: smoothed speed (canvas short sides per second) and turning rate.
     let speed = 0;
@@ -473,8 +498,8 @@ export class SweepSession implements StyleSession, Simulation {
       // Expected droplets for this step; the stroke's RNG keeps it deterministic.
       let expected = Math.min(energy, 3) * splash * spacing * 0.025;
       let n = 0;
-      // Flung paint is what the brush carries: a moderately old row of its history.
-      const row = Math.max(0, step - Math.round(lagMax * 0.4)) % HISTORY;
+      // Flung paint comes from the bead.
+      const row = step % HISTORY;
       while (n < 4 && rng.next() < expected) {
         expected -= 1;
         n++;
@@ -506,26 +531,36 @@ export class SweepSession implements StyleSession, Simulation {
       stamp(s: Stamp) {
         const pnx = -s.prevDirY, pny = s.prevDirX;
         const cnx = -s.dirY, cny = s.dirX;
-        // 1. Record what each bristle picks up into this step's history row.
+        const dt = s.time - lastTime;
+        if (s.index > 0 && dt > 0.01) {
+          const v = ((spacing / dt) * 1000) / session.shortSide; // short sides per second
+          speed += (v - speed) * Math.min(1, spacing / (width * 0.05));
+          lastTime = s.time;
+        }
+        // 1. Update the bead. A fast brush gives it less time to flow sideways per distance.
         const row = step % HISTORY;
-        session.pickup.setUniforms(pickupUniforms);
+        session.pickup.setUniforms(brushUniforms);
         session.pickup.setUniforms({
-          uSrc0: session.paint.textures[0]!,
-          uSrc1: session.paint.textures[1]!,
+          uPaint0: session.paint.textures[0]!,
+          uPaint1: session.paint.textures[1]!,
+          uPrevRow: (step + HISTORY - 1) % HISTORY,
+          uFresh: s.index === 0 ? 1 : 0,
+          uFlow: flow * Math.min(1.2, Math.max(0.6, 1.2 - 0.25 * speed)),
+          uDistance: s.distance,
           uPrevPos: [s.prevX, s.prevY],
           uCurPos: [s.x, s.y],
           uPrevNormal: [pnx, pny],
           uCurNormal: [cnx, cny],
         });
-        gpu.draw(session.history, session.pickup, rectVertices(0, row, BRISTLES, 1));
+        gpu.updateInPlace(session.history, session.pickup, rectVertices(0, row, BRISTLES, 1));
         if (s.index === 0) {
           lastTime = s.time;
           lastStamp = s;
           step++;
-          return; // first contact only loads the brush
+          return; // first contact: the brush starts empty
         }
 
-        // 2. Lay down earlier paint over the swept quad (triangle strip).
+        // 2. Move the paint under the swept quad (triangle strip).
         const h = width / 2 + margin;
         const um = margin / width;
         const verts = new Float32Array([
@@ -534,18 +569,13 @@ export class SweepSession implements StyleSession, Simulation {
           s.x - cnx * h, s.y - cny * h, -um, 1,
           s.x + cnx * h, s.y + cny * h, 1 + um, 1,
         ]);
+        session.deposit.setUniforms(brushUniforms);
         session.deposit.setUniforms(depositUniforms);
-        session.deposit.setUniforms({ uStep: step, uDistance: s.distance });
+        session.deposit.setUniforms({ uRow: row, uStep: step, uDistance: s.distance });
         gpu.updateInPlace(session.paint, session.deposit, verts);
         session.ctx.markDirty(expand(boundsOf(verts, 4), 2));
 
         // 3. Momentum splashes.
-        const dt = s.time - lastTime;
-        if (dt > 0.01) {
-          const v = ((spacing / dt) * 1000) / session.shortSide; // short sides per second
-          speed += (v - speed) * Math.min(1, spacing / (width * 0.05));
-          lastTime = s.time;
-        }
         const turn = s.prevDirX * s.dirY - s.prevDirY * s.dirX; // radians per step (signed)
         const curvature = Math.abs(turn) / spacing; // 1/px
         const centripetal = speed * speed * curvature * session.shortSide;
@@ -555,9 +585,28 @@ export class SweepSession implements StyleSession, Simulation {
         step++;
       },
       end() {
-        // Stopping fast: the carried paint keeps going and splashes ahead of the brush.
         const s = lastStamp;
-        if (s && speed > 1.6 && splash > 0) fling(s, (speed - 1.6) * 2, 0);
+        if (!s || s.index === 0) return;
+        // Stopping fast: the carried paint keeps going and splashes ahead of the brush.
+        if (speed > 1.6 && splash > 0) fling(s, (speed - 1.6) * 2, 0);
+        // The rest of the bead stays where the brush is lifted.
+        const nx = -s.dirY, ny = s.dirX;
+        const len = width * 0.3;
+        const hw = width / 2;
+        const verts = new Float32Array([
+          s.x - nx * hw, s.y - ny * hw, 0, 0,
+          s.x + nx * hw, s.y + ny * hw, 1, 0,
+          s.x - nx * hw + s.dirX * len, s.y - ny * hw + s.dirY * len, 0, len,
+          s.x + nx * hw + s.dirX * len, s.y + ny * hw + s.dirY * len, 1, len,
+        ]);
+        session.release.setUniforms({
+          uHistory: session.history.textures[0]!,
+          uRow: (step + HISTORY - 1) % HISTORY,
+          uWidthPx: width,
+          uMaxLength: len,
+        });
+        gpu.updateInPlace(session.paint, session.release, verts);
+        session.ctx.markDirty(expand(boundsOf(verts, 4), 2));
       },
     };
   }
@@ -608,7 +657,7 @@ export class SweepSession implements StyleSession, Simulation {
     this.paint.dispose();
     this.back.dispose();
     this.history.dispose();
-    [this.inject, this.spread, this.droplet, this.pour, this.pickup, this.deposit, this.composite].forEach((p) =>
+    [this.inject, this.spread, this.droplet, this.pour, this.pickup, this.deposit, this.release, this.composite].forEach((p) =>
       p.dispose(),
     );
   }
